@@ -1,0 +1,151 @@
+package middleware_test
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
+	"github.com/jungo-dev/junkit/middleware"
+	"github.com/jungo-dev/junkit/notification"
+)
+
+func newLimiterRouter(opts middleware.LimiterOptions, notifier notification.Notifier) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(middleware.Limiter(opts, zap.NewNop(), newResponder(), notifier))
+	router.GET("/", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+	return router
+}
+
+func baseLimiterOptions() middleware.LimiterOptions {
+	return middleware.LimiterOptions{
+		RequestsPerSecond: 1,
+		Burst:             1,
+		CleanupInterval:   time.Minute,
+		ClientTTL:         time.Minute,
+		LogTTL:            time.Minute,
+	}
+}
+
+func TestLimiter_AllowsWithinBurstThenRejects(t *testing.T) {
+	router := newLimiterRouter(baseLimiterOptions(), newFakeNotifier())
+
+	req := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = "203.0.113.10:1234"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		return w
+	}
+
+	if w := req(); w.Code != http.StatusOK {
+		t.Fatalf("first request status = %d, want %d (within burst)", w.Code, http.StatusOK)
+	}
+	if w := req(); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request status = %d, want %d (burst exhausted)", w.Code, http.StatusTooManyRequests)
+	}
+}
+
+func TestLimiter_DifferentIPsHaveIndependentLimits(t *testing.T) {
+	router := newLimiterRouter(baseLimiterOptions(), newFakeNotifier())
+
+	for _, ip := range []string{"203.0.113.1:1", "203.0.113.2:1"} {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = ip
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("first request from %s status = %d, want %d", ip, w.Code, http.StatusOK)
+		}
+	}
+}
+
+func TestLimiter_WhitelistedIPBypassesTheLimit(t *testing.T) {
+	opts := baseLimiterOptions()
+	opts.IPWhitelist = []string{"203.0.113.10"}
+	router := newLimiterRouter(opts, newFakeNotifier())
+
+	for i := 0; i < 5; i++ {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = "203.0.113.10:1234"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d from a whitelisted IP status = %d, want %d", i, w.Code, http.StatusOK)
+		}
+	}
+}
+
+func TestLimiter_KnownTestClientUserAgentsBypass(t *testing.T) {
+	tests := []string{"PostmanRuntime/7.36.0", "GoHttpTest/1.0"}
+
+	for _, ua := range tests {
+		t.Run(ua, func(t *testing.T) {
+			router := newLimiterRouter(baseLimiterOptions(), newFakeNotifier())
+
+			for i := 0; i < 5; i++ {
+				r := httptest.NewRequest(http.MethodGet, "/", nil)
+				r.RemoteAddr = "203.0.113.10:1234"
+				r.Header.Set("User-Agent", ua)
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, r)
+				if w.Code != http.StatusOK {
+					t.Fatalf("request %d with User-Agent %q status = %d, want %d", i, ua, w.Code, http.StatusOK)
+				}
+			}
+		})
+	}
+}
+
+func TestLimiter_ExceedingTheLimitNotifiesOnce(t *testing.T) {
+	notifier := newFakeNotifier()
+	opts := baseLimiterOptions()
+	opts.LogTTL = time.Hour // keep the log/alert throttle open for the whole test
+	router := newLimiterRouter(opts, notifier)
+
+	send := func() *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = "203.0.113.20:1234"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		return w
+	}
+
+	send()      // consumes the single burst token
+	send()      // exceeds the limit -> should notify
+	w := send() // exceeds again -> should NOT notify again within LogTTL
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusTooManyRequests)
+	}
+
+	select {
+	case <-notifier.messages:
+		// got the expected single alert
+	case <-time.After(time.Second):
+		t.Fatal("expected an alert message to be sent after exceeding the rate limit")
+	}
+
+	select {
+	case msg := <-notifier.messages:
+		t.Fatalf("got a second alert message %q within LogTTL, want the throttle to suppress it", msg)
+	case <-time.After(100 * time.Millisecond):
+		// correctly throttled — no second message arrived
+	}
+}
+
+func TestLimiter_NilNotifierIsSafe(t *testing.T) {
+	router := newLimiterRouter(baseLimiterOptions(), nil)
+
+	for i := 0; i < 3; i++ {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.RemoteAddr = "203.0.113.30:1234"
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+	}
+	// The real assertion is that none of this panicked with a nil notifier.
+}

@@ -1,0 +1,94 @@
+package tracer
+
+import (
+	"net/http"
+	"reflect"
+	"testing"
+)
+
+func TestCloneHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("Authorization", "Bearer abcdefghijklmnopqrstuvwxyz")
+	h.Set("Cookie", "session=secret")
+	h.Set("Content-Type", "application/json")
+
+	clone := cloneHeaders(h)
+
+	if clone.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type = %q, want it unchanged", clone.Get("Content-Type"))
+	}
+	if clone.Get("Authorization") == h.Get("Authorization") {
+		t.Error("Authorization should be masked in the clone")
+	}
+	if clone.Get("Cookie") == h.Get("Cookie") {
+		t.Error("Cookie should be masked in the clone")
+	}
+
+	// Mutating the clone must not affect the original — it's a deep copy.
+	clone.Set("Content-Type", "text/plain")
+	if h.Get("Content-Type") != "application/json" {
+		t.Error("mutating the clone leaked back into the original headers")
+	}
+
+	if got := cloneHeaders(nil); got != nil {
+		t.Fatalf("cloneHeaders(nil) = %v, want nil", got)
+	}
+}
+
+func TestCloneHeaders_DoesNotAliasSliceBackingArrays(t *testing.T) {
+	h := http.Header{"X-Multi": []string{"a", "b"}}
+	clone := cloneHeaders(h)
+
+	clone["X-Multi"][0] = "mutated"
+	if h["X-Multi"][0] != "a" {
+		t.Fatal("cloneHeaders shares backing arrays with the original — a mutation leaked through")
+	}
+	if !reflect.DeepEqual(h["X-Multi"], []string{"a", "b"}) {
+		t.Fatalf("original header slice = %v, want unchanged", h["X-Multi"])
+	}
+}
+
+func TestMaskAuthorization(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "a long Bearer token is masked", in: "Bearer abcdefghijklmnopqrstuvwxyz", want: "Bearer abcdefgh...****"},
+		{name: "a short value is left alone", in: "Bearer short", want: "Bearer short"},
+		{name: "a non-Bearer scheme is left alone", in: "Basic dXNlcjpwYXNz", want: "Basic dXNlcjpwYXNz"},
+		{name: "empty string", in: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := maskAuthorization(tt.in); got != tt.want {
+				t.Fatalf("maskAuthorization(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMaskCookie(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty string", in: "", want: ""},
+		{name: "single cookie", in: "session=secretvalue", want: "session=****"},
+		{
+			name: "multiple cookies keep their names, values masked",
+			in:   "session=secretvalue; theme=dark",
+			want: "session=****; theme=****",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := maskCookie(tt.in); got != tt.want {
+				t.Fatalf("maskCookie(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

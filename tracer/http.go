@@ -1,0 +1,164 @@
+package tracer
+
+import (
+	"context"
+	"net"
+	"net/http"
+	"os"
+	"runtime"
+	"strings"
+	"time"
+)
+
+// getHostname returns the current machine's hostname, or "unknown" if it can't be determined.
+func getHostname() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return h
+}
+
+// getServerIP returns the first non-loopback IPv4 address on this machine, or "unknown".
+func getServerIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "unknown"
+	}
+	for _, a := range addrs {
+		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
+			return ipnet.IP.String()
+		}
+	}
+	return "unknown"
+}
+
+// splitHostPort splits addr into host and port, tolerating a bare host with no port.
+func splitHostPort(addr string) (host, port string) {
+	if !strings.ContainsRune(addr, ':') {
+		return addr, ""
+	}
+	h, p, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, ""
+	}
+	return h, p
+}
+
+// ServerInfo collects request and server environment details for debug tracing.
+func ServerInfo(r *http.Request) map[string]any {
+	host, port := splitHostPort(r.Host)
+	_, clientPort := splitHostPort(r.RemoteAddr)
+
+	return map[string]any{
+		"timestamp":       time.Now().UnixMilli(),
+		"method":          r.Method,
+		"full_url":        rebuildFullURL(r),
+		"path":            r.URL.Path,
+		"query_string":    r.URL.RawQuery,
+		"protocol":        r.Proto,
+		"host":            host,
+		"host_port":       port,
+		"server_name":     getHostname(),
+		"server_ip":       getServerIP(),
+		"client_ip":       getRealClientIP(r),
+		"client_port":     clientPort,
+		"x_forwarded_for": r.Header.Get("X-Forwarded-For"),
+		"x_real_ip":       r.Header.Get("X-Real-IP"),
+		"user_agent":      r.UserAgent(),
+		"referer":         r.Referer(),
+		"content_type":    r.Header.Get("Content-Type"),
+		"authorization":   maskAuthorization(r.Header.Get("Authorization")),
+		"cookie":          maskCookie(r.Header.Get("Cookie")),
+		"headers":         cloneHeaders(r.Header),
+		"go_version":      runtime.Version(),
+		"pid":             os.Getpid(),
+		"goroutines":      runtime.NumGoroutine(),
+	}
+}
+
+// HTTPInfo records HTTP request and server info on the ctx Debugger.
+func HTTPInfo(ctx context.Context, r *http.Request) {
+	d := FromContext(ctx)
+	if !d.IsEnabled() {
+		return
+	}
+
+	d.Append(LogEntry{
+		Type:  "variable",
+		Label: "REQUEST & SERVER INFO",
+		Data:  ServerInfo(r),
+	})
+}
+
+// getRealClientIP resolves originating client IP from X-Real-IP, X-Forwarded-For, or RemoteAddr.
+func getRealClientIP(r *http.Request) string {
+	if ip := r.Header.Get("X-Real-IP"); ip != "" {
+		if idx := strings.IndexByte(ip, ','); idx != -1 {
+			return strings.TrimSpace(ip[:idx])
+		}
+		return ip
+	}
+
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		parts := strings.Split(fwd, ",")
+		return strings.TrimSpace(parts[0])
+	}
+
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
+}
+
+// rebuildFullURL reconstructs r's absolute URL, honoring TLS/X-Forwarded-Proto for scheme.
+func rebuildFullURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host + r.RequestURI
+}
+
+// maskAuthorization redacts sensitive token values in the Authorization header.
+func maskAuthorization(s string) string {
+	if len(s) < 20 || !strings.HasPrefix(s, "Bearer ") {
+		return s
+	}
+	return s[:15] + "...****"
+}
+
+// maskCookie replaces every cookie value with "****", keeping the cookie names visible.
+func maskCookie(s string) string {
+	if s == "" {
+		return ""
+	}
+
+	parts := strings.Split(s, "; ")
+	for i, p := range parts {
+		if eq := strings.IndexByte(p, '='); eq > 0 {
+			parts[i] = p[:eq+1] + "****"
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// cloneHeaders deep-copies http.Header while redacting sensitive Authorization and Cookie values.
+func cloneHeaders(h http.Header) http.Header {
+	if h == nil {
+		return nil
+	}
+
+	clone := make(http.Header, len(h))
+	for k, vv := range h {
+		vv2 := make([]string, len(vv))
+		copy(vv2, vv)
+
+		if k == "Authorization" && len(vv2) > 0 {
+			vv2[0] = maskAuthorization(vv2[0])
+		}
+		if k == "Cookie" && len(vv2) > 0 {
+			vv2[0] = maskCookie(vv2[0])
+		}
+		clone[k] = vv2
+	}
+	return clone
+}
