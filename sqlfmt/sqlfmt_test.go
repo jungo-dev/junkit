@@ -1,13 +1,12 @@
-package database_test
+package sqlfmt
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
-
-	"github.com/jungo-dev/junkit/database"
 )
 
 func TestFormatValue(t *testing.T) {
@@ -190,14 +189,14 @@ func TestFormatValue(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := database.FormatValue(tt.v); got != tt.want {
+			if got := FormatValue(tt.v); got != tt.want {
 				t.Fatalf("FormatValue(%#v) = %q, want %q", tt.v, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestBindArgsToSQL(t *testing.T) {
+func TestBind(t *testing.T) {
 	tests := []struct {
 		name string
 		sql  string
@@ -250,9 +249,80 @@ func TestBindArgsToSQL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := database.BindArgsToSQL(tt.sql, tt.args); got != tt.want {
-				t.Fatalf("BindArgsToSQL(%q, %v) = %q, want %q", tt.sql, tt.args, got, tt.want)
+			if got := Bind(tt.sql, tt.args); got != tt.want {
+				t.Fatalf("Bind(%q, %v) = %q, want %q", tt.sql, tt.args, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGuessName(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{name: "select", sql: "SELECT * FROM users", want: "Select"},
+		{name: "lowercase keyword is still recognized", sql: "select * from users", want: "Select"},
+		{name: "insert", sql: "INSERT INTO users (email) VALUES ($1)", want: "Insert"},
+		{name: "update", sql: "UPDATE users SET email = $1", want: "Update"},
+		{name: "delete", sql: "DELETE FROM users", want: "Delete"},
+		{name: "with (CTE)", sql: "WITH recent AS (SELECT 1) SELECT * FROM recent", want: "With"},
+		{name: "unrecognized keyword falls back to Query", sql: "BEGIN", want: "Query"},
+		{name: "empty string falls back to Query", sql: "", want: "Query"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := guessName(tt.sql); got != tt.want {
+				t.Fatalf("guessName(%q) = %q, want %q", tt.sql, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParse(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want Info
+	}{
+		{
+			name: "a sqlc name annotation is parsed",
+			sql:  "-- name: GetUserByUUID :one\nSELECT * FROM users WHERE uuid = $1",
+			want: Info{Name: "GetUserByUUID", Operation: "ONE", SQL: "SELECT * FROM users WHERE uuid = $1"},
+		},
+		{
+			name: "no annotation falls back to a guessed name",
+			sql:  "SELECT * FROM users",
+			want: Info{Name: "Select", SQL: "SELECT * FROM users"},
+		},
+		{
+			name: "comments and extra whitespace are stripped",
+			sql:  "SELECT *\n  -- this is a comment\n  FROM   users\nWHERE  id = 1",
+			want: Info{Name: "Select", SQL: "SELECT * FROM users WHERE id = 1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := Parse(tt.sql); got != tt.want {
+				t.Fatalf("Parse(%q) = %+v, want %+v", tt.sql, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParse_CacheIsBounded(t *testing.T) {
+	for i := range maxCached + 50 {
+		Parse(fmt.Sprintf("SELECT %d", i))
+	}
+	if n := cacheSize.Load(); n > maxCached {
+		t.Fatalf("cacheSize = %d, want at most %d", n, maxCached)
+	}
+
+	// Queries past the cap are still parsed correctly, just not cached.
+	if got := Parse("SELECT 'uncached'"); got.Name != "Select" {
+		t.Fatalf("Parse past the cap = %+v, want Name=Select", got)
 	}
 }

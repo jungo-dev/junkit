@@ -79,16 +79,9 @@ func ServerInfo(r *http.Request) map[string]any {
 
 // HTTPInfo records HTTP request and server info on the ctx Debugger.
 func HTTPInfo(ctx context.Context, r *http.Request) {
-	d := FromContext(ctx)
-	if !d.IsEnabled() {
-		return
+	if d := FromContext(ctx); d != nil {
+		d.record(TypeVariable, "REQUEST & SERVER INFO", ServerInfo(r))
 	}
-
-	d.Append(LogEntry{
-		Type:  "variable",
-		Label: "REQUEST & SERVER INFO",
-		Data:  ServerInfo(r),
-	})
 }
 
 // getRealClientIP resolves originating client IP from X-Real-IP, X-Forwarded-For, or RemoteAddr.
@@ -118,12 +111,15 @@ func rebuildFullURL(r *http.Request) string {
 	return scheme + "://" + r.Host + r.RequestURI
 }
 
-// maskAuthorization redacts sensitive token values in the Authorization header.
+// maskAuthorization keeps only the auth scheme (e.g. "Bearer") and hides the credentials.
 func maskAuthorization(s string) string {
-	if len(s) < 20 || !strings.HasPrefix(s, "Bearer ") {
-		return s
+	if s == "" {
+		return ""
 	}
-	return s[:15] + "...****"
+	if scheme, _, ok := strings.Cut(s, " "); ok {
+		return scheme + " ****"
+	}
+	return "****"
 }
 
 // maskCookie replaces every cookie value with "****", keeping the cookie names visible.
@@ -141,7 +137,27 @@ func maskCookie(s string) string {
 	return strings.Join(parts, "; ")
 }
 
-// cloneHeaders deep-copies http.Header while redacting sensitive Authorization and Cookie values.
+// secretHeaderHints are substrings marking a header name as carrying a secret.
+var secretHeaderHints = []string{"token", "secret", "password", "api-key", "apikey", "signature", "session"}
+
+// maskHeader returns value with any secret it carries, as judged by the header name, hidden.
+func maskHeader(name, value string) string {
+	lower := strings.ToLower(name)
+	switch lower {
+	case "authorization", "proxy-authorization":
+		return maskAuthorization(value)
+	case "cookie", "set-cookie":
+		return maskCookie(value)
+	}
+	for _, hint := range secretHeaderHints {
+		if strings.Contains(lower, hint) {
+			return "****"
+		}
+	}
+	return value
+}
+
+// cloneHeaders deep-copies h, masking every value of secret-bearing headers.
 func cloneHeaders(h http.Header) http.Header {
 	if h == nil {
 		return nil
@@ -149,16 +165,11 @@ func cloneHeaders(h http.Header) http.Header {
 
 	clone := make(http.Header, len(h))
 	for k, vv := range h {
-		vv2 := make([]string, len(vv))
-		copy(vv2, vv)
-
-		if k == "Authorization" && len(vv2) > 0 {
-			vv2[0] = maskAuthorization(vv2[0])
+		masked := make([]string, len(vv))
+		for i, v := range vv {
+			masked[i] = maskHeader(k, v)
 		}
-		if k == "Cookie" && len(vv2) > 0 {
-			vv2[0] = maskCookie(vv2[0])
-		}
-		clone[k] = vv2
+		clone[k] = masked
 	}
 	return clone
 }

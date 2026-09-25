@@ -54,9 +54,10 @@ func TestMaskAuthorization(t *testing.T) {
 		in   string
 		want string
 	}{
-		{name: "a long Bearer token is masked", in: "Bearer abcdefghijklmnopqrstuvwxyz", want: "Bearer abcdefgh...****"},
-		{name: "a short value is left alone", in: "Bearer short", want: "Bearer short"},
-		{name: "a non-Bearer scheme is left alone", in: "Basic dXNlcjpwYXNz", want: "Basic dXNlcjpwYXNz"},
+		{name: "a Bearer token keeps only the scheme", in: "Bearer abcdefghijklmnopqrstuvwxyz", want: "Bearer ****"},
+		{name: "a short token is masked too", in: "Bearer short", want: "Bearer ****"},
+		{name: "other schemes are masked", in: "Basic dXNlcjpwYXNz", want: "Basic ****"},
+		{name: "a bare credential is fully masked", in: "raw-api-key", want: "****"},
 		{name: "empty string", in: "", want: ""},
 	}
 
@@ -90,5 +91,31 @@ func TestMaskCookie(t *testing.T) {
 				t.Fatalf("maskCookie(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCloneHeaders_MasksSecretHeaders(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Api-Key", "k-123")
+	h.Set("X-Auth-Token", "t-456")
+	h.Set("Proxy-Authorization", "Basic abc")
+	h["Authorization"] = []string{"Bearer one", "Bearer two"}
+	h.Set("Accept", "application/json")
+
+	clone := cloneHeaders(h)
+
+	for _, name := range []string{"X-Api-Key", "X-Auth-Token"} {
+		if got := clone.Get(name); got != "****" {
+			t.Errorf("%s = %q, want ****", name, got)
+		}
+	}
+	if got := clone.Get("Proxy-Authorization"); got != "Basic ****" {
+		t.Errorf("Proxy-Authorization = %q, want %q", got, "Basic ****")
+	}
+	if got := clone["Authorization"]; !reflect.DeepEqual(got, []string{"Bearer ****", "Bearer ****"}) {
+		t.Errorf("Authorization = %v, want every value masked", got)
+	}
+	if got := clone.Get("Accept"); got != "application/json" {
+		t.Errorf("Accept = %q, want it unchanged", got)
 	}
 }

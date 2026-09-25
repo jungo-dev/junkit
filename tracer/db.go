@@ -2,30 +2,49 @@ package tracer
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/jungo-dev/junkit/sqlfmt"
 )
 
-// dbtx defines the common database query-execution interface shared by pool and transaction handles.
+// dbtx defines the common query-execution interface shared by pool and transaction handles.
 type dbtx interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// maxTracedRows caps the maximum number of rows captured per traced query for dashboard display.
+// maxTracedRows caps the number of rows captured per traced query.
 const maxTracedRows = 20
 
-// DBWrapper wraps a dbtx pool handle to record query execution data in Debugger.
+// SQLData is the payload of a traced SQL query entry.
+type SQLData struct {
+	SQL          string           `json:"sql,omitempty"`
+	Operation    string           `json:"operation,omitempty"`
+	Result       map[string]any   `json:"result,omitempty"`    // QueryRow
+	Rows         []map[string]any `json:"rows,omitempty"`      // Query, up to maxTracedRows
+	RowCount     *int             `json:"row_count,omitempty"` // Query, true total
+	RowsAffected *int64           `json:"rows_affected,omitempty"`
+	Error        string           `json:"error,omitempty"`
+	Location     string           `json:"location,omitempty"` // failed queries: app code that ran it
+	Function     string           `json:"function,omitempty"`
+
+	query string // SQL before binding args; groups repeated queries for N+1 detection
+}
+
+// DBWrapper wraps a pool or transaction handle to record queries on ctx's Debugger.
 type DBWrapper struct {
 	inner dbtx
 }
 
-// NewDBWrapper creates a DBWrapper wrapping the provided dbtx handle.
+// NewDBWrapper wraps inner, which may be a pool or a pgx.Tx.
 //
 // Usage:
 //
@@ -36,294 +55,173 @@ func NewDBWrapper(inner dbtx) *DBWrapper {
 	return &DBWrapper{inner: inner}
 }
 
-// Exec implements dbtx, tracing the call (including rows affected) when debugging is enabled on ctx.
+// Exec implements dbtx, recording rows affected when debugging is enabled on ctx.
 func (w *DBWrapper) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if !IsEnabledCtx(ctx) {
+	q := beginQuery(ctx, sql, args)
+	if q == nil {
 		return w.inner.Exec(ctx, sql, args...)
 	}
-	ts := beginTrace(ctx, sql, args)
 	tag, err := w.inner.Exec(ctx, sql, args...)
-	ts.end(ctx)
-	recordQuery(ctx, ts, execResult(tag), err)
-	return tag, err
-}
-
-// Query implements dbtx, wrapping rows to record query results when debugging is enabled.
-func (w *DBWrapper) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	if !IsEnabledCtx(ctx) {
-		return w.inner.Query(ctx, sql, args...)
-	}
-	return tracedQuery(ctx, w.inner, sql, args)
-}
-
-// QueryRow implements dbtx, recording scanned row values when debugging is enabled.
-func (w *DBWrapper) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	if !IsEnabledCtx(ctx) {
-		return w.inner.QueryRow(ctx, sql, args...)
-	}
-	return tracedQueryRow(ctx, w.inner, sql, args)
-}
-
-// TxWrapper wraps a transaction-scoped dbtx handle to trace query execution.
-//
-// Usage:
-//
-//	tx, _ := pool.Begin(ctx)
-//	traced := tracer.NewTxWrapper(tx)
-type TxWrapper struct {
-	inner dbtx
-}
-
-// NewTxWrapper wraps inner, typically the pgx.Tx a transaction began with.
-func NewTxWrapper(inner dbtx) *TxWrapper {
-	return &TxWrapper{inner: inner}
-}
-
-// Exec implements dbtx, tracing the call (including rows affected) when debugging is enabled on ctx.
-func (w *TxWrapper) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if !IsEnabledCtx(ctx) {
-		return w.inner.Exec(ctx, sql, args...)
-	}
-	ts := beginTrace(ctx, sql, args)
-	tag, err := w.inner.Exec(ctx, sql, args...)
-	ts.end(ctx)
-	recordQuery(ctx, ts, execResult(tag), err)
-	return tag, err
-}
-
-// Query implements dbtx, tracing rows the same way DBWrapper.Query does.
-func (w *TxWrapper) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	if !IsEnabledCtx(ctx) {
-		return w.inner.Query(ctx, sql, args...)
-	}
-	return tracedQuery(ctx, w.inner, sql, args)
-}
-
-// QueryRow implements dbtx, tracing the scanned row the same way DBWrapper.QueryRow does.
-func (w *TxWrapper) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
-	if !IsEnabledCtx(ctx) {
-		return w.inner.QueryRow(ctx, sql, args...)
-	}
-	return tracedQueryRow(ctx, w.inner, sql, args)
-}
-
-// traceSpan captures a traced SQL call's starting state: its timing and
-// timeline position (StartMS/depth), shared by Exec, Query, and QueryRow.
-type traceSpan struct {
-	start      time.Time
-	startMS    float64
-	depth      int
-	info       queryInfo
-	displaySQL string
-}
-
-// beginTrace starts query timing, reserves the query's slot on ctx's
-// Debugger timeline, and returns parsed display metadata.
-func beginTrace(ctx context.Context, sql string, args []any) traceSpan {
-	info := getQueryInfo(sql)
-	ts := traceSpan{
-		start:      time.Now(),
-		info:       info,
-		displaySQL: BindArgsToSQL(info.CleanSQL, args),
-	}
-	if d := FromContext(ctx); d != nil {
-		ts.startMS = d.elapsedMS()
-		ts.depth = d.pushSpanDepth()
-	}
-	return ts
-}
-
-// end marks the traced query span as finished.
-func (ts *traceSpan) end(ctx context.Context) {
-	if d := FromContext(ctx); d != nil {
-		d.popSpanDepth()
-	}
-}
-
-// execResult builds the result payload for a traced Exec call.
-func execResult(tag pgconn.CommandTag) sqlLogData {
 	n := tag.RowsAffected()
-	return sqlLogData{RowsAffected: &n}
+	q.finish(SQLData{RowsAffected: &n}, err)
+	return tag, err
 }
 
-// tracedQueryRow executes QueryRow and records scanned row values for tracing.
-func tracedQueryRow(ctx context.Context, q dbtx, sql string, args []any) pgx.Row {
-	ts := beginTrace(ctx, sql, args)
-
-	rows, err := q.Query(ctx, sql, args...)
+// Query implements dbtx, recording scanned rows when debugging is enabled on ctx.
+func (w *DBWrapper) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	q := beginQuery(ctx, sql, args)
+	if q == nil {
+		return w.inner.Query(ctx, sql, args...)
+	}
+	rows, err := w.inner.Query(ctx, sql, args...)
 	if err != nil {
-		ts.end(ctx)
-		recordQuery(ctx, ts, sqlLogData{}, err)
+		q.finish(SQLData{}, err)
+		return rows, err
+	}
+	return &tracedRows{Rows: rows, q: q}, nil
+}
+
+// QueryRow implements dbtx, recording the scanned row when debugging is enabled on ctx.
+func (w *DBWrapper) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	q := beginQuery(ctx, sql, args)
+	if q == nil {
+		return w.inner.QueryRow(ctx, sql, args...)
+	}
+	// Query instead of QueryRow so the column names are available at Scan time.
+	rows, err := w.inner.Query(ctx, sql, args...)
+	if err != nil {
+		q.finish(SQLData{}, err)
 		return errRow{err}
 	}
-
-	return &tracedRow{ctx: ctx, ts: ts, rows: rows}
+	return &tracedRow{rows: rows, q: q}
 }
 
-// errRow implements pgx.Row for deferred query errors.
+// pendingQuery is a traced query that has started but not yet been recorded.
+type pendingQuery struct {
+	d     *Debugger
+	start time.Time
+	atMS  float64
+	info  sqlfmt.Info
+	sql   string // SQL with arguments bound, for display
+}
+
+// beginQuery starts tracing a query, or returns nil when ctx has no Debugger.
+func beginQuery(ctx context.Context, sql string, args []any) *pendingQuery {
+	d := FromContext(ctx)
+	if d == nil {
+		return nil
+	}
+	info := sqlfmt.Parse(sql)
+	return &pendingQuery{
+		d:     d,
+		start: time.Now(),
+		atMS:  d.sinceStartMS(),
+		info:  info,
+		sql:   sqlfmt.Bind(info.SQL, args),
+	}
+}
+
+// finish records the query with its result payload and error.
+func (q *pendingQuery) finish(data SQLData, err error) {
+	data.SQL = q.sql
+	data.query = q.info.SQL
+	data.Operation = q.info.Operation
+	if err != nil {
+		data.Error = err.Error()
+		data.Location, data.Function = sqlfmt.Origin()
+	}
+	q.d.Append(LogEntry{Type: TypeSQL, Label: q.info.Name, AtMS: q.atMS, DurationMS: msSince(q.start), Data: data})
+}
+
+// errRow implements pgx.Row for a query that failed before any row was read.
 type errRow struct{ err error }
 
 // Scan implements pgx.Row.
 func (r errRow) Scan(...any) error { return r.err }
 
-// tracedRow wraps pgx.Row to record scanned row data for the debug dashboard.
+// tracedRow implements pgx.Row, recording the scanned row.
 type tracedRow struct {
-	ctx  context.Context
-	ts   traceSpan
 	rows pgx.Rows
+	q    *pendingQuery
 }
 
 // Scan implements pgx.Row.
 func (r *tracedRow) Scan(dest ...any) error {
 	defer r.rows.Close()
-	defer r.ts.end(r.ctx)
 
 	if !r.rows.Next() {
 		err := r.rows.Err()
 		if err == nil {
 			err = pgx.ErrNoRows
 		}
-		recordQuery(r.ctx, r.ts, sqlLogData{}, err)
+		r.q.finish(SQLData{}, err)
 		return err
 	}
 
 	err := r.rows.Scan(dest...)
-	names := fieldNames(r.rows.FieldDescriptions())
-	result := zipColumns(names, derefAll(dest))
-
 	if err == nil {
 		err = r.rows.Err()
 	}
-	recordQuery(r.ctx, r.ts, sqlLogData{Result: result}, err)
+	r.q.finish(SQLData{Result: rowMap(r.rows.FieldDescriptions(), dest)}, err)
 	return err
 }
 
-// tracedQuery wraps pgx.Query to record scanned rows for the debug dashboard.
-func tracedQuery(ctx context.Context, q dbtx, sql string, args []any) (pgx.Rows, error) {
-	ts := beginTrace(ctx, sql, args)
-
-	rows, err := q.Query(ctx, sql, args...)
-	if err != nil {
-		ts.end(ctx)
-		recordQuery(ctx, ts, sqlLogData{}, err)
-		return rows, err
-	}
-
-	return &tracedRows{Rows: rows, ctx: ctx, ts: ts}, nil
-}
-
-// tracedRows wraps pgx.Rows to collect scanned rows and record them on Close.
+// tracedRows wraps pgx.Rows, collecting scanned rows and recording them on Close.
 type tracedRows struct {
 	pgx.Rows
-	ctx   context.Context
-	ts    traceSpan
-	rows  []map[string]any
-	total int
+	q      *pendingQuery
+	rows   []map[string]any
+	total  int
+	closed bool
 }
 
-// Scan implements pgx.Rows, collecting this row's values (up to maxTracedRows) alongside the real Scan.
+// Scan implements pgx.Rows, capturing up to maxTracedRows rows.
 func (r *tracedRows) Scan(dest ...any) error {
-	err := r.Rows.Scan(dest...)
-	if err != nil {
+	if err := r.Rows.Scan(dest...); err != nil {
 		return err
 	}
-
 	r.total++
 	if len(r.rows) < maxTracedRows {
-		names := fieldNames(r.Rows.FieldDescriptions())
-		r.rows = append(r.rows, zipColumns(names, derefAll(dest)))
+		r.rows = append(r.rows, rowMap(r.Rows.FieldDescriptions(), dest))
 	}
 	return nil
 }
 
-// Close implements pgx.Rows, recording the collected rows (and true total) once the caller is done.
+// Close implements pgx.Rows, recording the query once even if called repeatedly.
 func (r *tracedRows) Close() {
 	r.Rows.Close()
-	r.ts.end(r.ctx)
-
-	data := sqlLogData{RowCount: &r.total, Rows: r.rows}
-	if r.total > len(r.rows) {
-		data.Truncated = fmt.Sprintf("showing first %d of %d rows", len(r.rows), r.total)
-	}
-	recordQuery(r.ctx, r.ts, data, r.Rows.Err())
-}
-
-// sqlLogData defines the dashboard entry payload for a traced SQL query.
-type sqlLogData struct {
-	SQL          string           `json:"sql"`
-	QueryName    string           `json:"query_name"`
-	Operation    string           `json:"operation"`
-	DurationMS   float64          `json:"duration_ms"`
-	StartMS      float64          `json:"start_ms"`
-	Depth        int              `json:"depth"`
-	Result       any              `json:"result,omitempty"`
-	RowCount     *int             `json:"row_count,omitempty"`
-	Rows         []map[string]any `json:"rows,omitempty"`
-	Truncated    string           `json:"truncated,omitempty"`
-	RowsAffected *int64           `json:"rows_affected,omitempty"`
-	Error        string           `json:"error,omitempty"`
-}
-
-// recordQuery appends a traced SQL result log entry to the active Debugger.
-func recordQuery(ctx context.Context, ts traceSpan, extra sqlLogData, err error) {
-	d := FromContext(ctx)
-	if d == nil {
+	if r.closed {
 		return
 	}
-
-	durMS := float64(time.Since(ts.start).Microseconds()) / 1000.0
-	d.SetLastQueryInfo(ts.info.QueryName, ts.info.OperationType, ts.displaySQL, durMS)
-
-	data := extra
-	data.SQL = ts.displaySQL
-	data.QueryName = ts.info.QueryName
-	data.Operation = ts.info.OperationType
-	data.DurationMS = durMS
-	data.StartMS = ts.startMS
-	data.Depth = ts.depth
-	if err != nil {
-		data.Error = err.Error()
-	}
-
-	d.Append(LogEntry{
-		Type:  "sql_result",
-		Label: fmt.Sprintf("%s | %.2fms", ts.info.QueryName, durMS),
-		Data:  data,
-	})
+	r.closed = true
+	r.q.finish(SQLData{Rows: r.rows, RowCount: &r.total}, r.Rows.Err())
 }
 
-// derefAll dereferences pointer elements in dest by one level.
-func derefAll(dest []any) []any {
-	out := make([]any, len(dest))
+// rowMap pairs column names with the scanned values in dest.
+func rowMap(fds []pgconn.FieldDescription, dest []any) map[string]any {
+	row := make(map[string]any, len(dest))
 	for i, d := range dest {
-		v := reflect.ValueOf(d)
-		if v.Kind() == reflect.Ptr && !v.IsNil() {
-			out[i] = v.Elem().Interface()
-		} else {
-			out[i] = d
-		}
-	}
-	return out
-}
-
-// fieldNames extracts column names from pgx field descriptions.
-func fieldNames(fds []pgconn.FieldDescription) []string {
-	names := make([]string, len(fds))
-	for i, fd := range fds {
-		names[i] = fd.Name
-	}
-	return names
-}
-
-// zipColumns pairs column names with values into a map.
-func zipColumns(names []string, values []any) map[string]any {
-	result := make(map[string]any, len(values))
-	for i, v := range values {
 		key := fmt.Sprintf("col_%d", i)
-		if i < len(names) && names[i] != "" {
-			key = names[i]
+		if i < len(fds) && fds[i].Name != "" {
+			key = fds[i].Name
 		}
-		result[key] = v
+		row[key] = displayValue(d)
 	}
-	return result
+	return row
+}
+
+// displayValue dereferences a Scan destination and makes raw bytes readable:
+// JSON (e.g. a jsonb column) is kept as JSON, anything else becomes hex.
+func displayValue(dest any) any {
+	v := reflect.ValueOf(dest)
+	if v.Kind() == reflect.Pointer && !v.IsNil() {
+		dest = v.Elem().Interface()
+	}
+	if b, ok := dest.([]byte); ok {
+		if json.Valid(b) {
+			return json.RawMessage(b)
+		}
+		return hex.EncodeToString(b)
+	}
+	return dest
 }

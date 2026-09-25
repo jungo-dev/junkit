@@ -30,31 +30,29 @@ func TestFindErrorOrigin_ReportsTheCallerOfItsWrapper(t *testing.T) {
 
 // TestFindErrorOrigin_ThroughW tests that tracer.W correctly attributes the line number of its caller.
 func TestFindErrorOrigin_ThroughW(t *testing.T) {
-	d := tracer.New()
-	d.Enable()
-	ctx := tracer.WithContext(context.Background(), d)
+	ctx := tracer.WithContext(context.Background(), tracer.New())
+	d := tracer.FromContext(ctx)
 
 	_, _, callerLine, _ := runtime.Caller(0)
 	tracer.W(ctx, "test warning", "boom") // <-- the next line after callerLine; must match wantLine below
 	wantLine := callerLine + 1
 
-	logs := d.GetLogs()
+	logs := d.Logs()
 	if len(logs) != 1 {
 		t.Fatalf("got %d log entries, want 1", len(logs))
 	}
 
-	data, ok := logs[0].Data.(map[string]any)
+	data, ok := logs[0].Data.(tracer.IssueData)
 	if !ok {
-		t.Fatalf("log entry Data = %#v, want map[string]any", logs[0].Data)
+		t.Fatalf("log entry Data = %#v, want tracer.IssueData", logs[0].Data)
 	}
-
-	if loc, _ := data["location"].(string); !strings.HasSuffix(loc, "origin_test.go") {
-		t.Fatalf(`data["location"] = %v, want it to end in "origin_test.go"`, data["location"])
+	if !strings.HasSuffix(data.Location, "origin_test.go") {
+		t.Fatalf("Location = %q, want it to end in origin_test.go", data.Location)
 	}
-	if line, _ := data["line"].(int); line != wantLine {
-		t.Fatalf(`data["line"] = %v, want %d (the tracer.W call site, not one frame further up)`, data["line"], wantLine)
+	if data.Line != wantLine {
+		t.Fatalf("Line = %d, want %d (the tracer.W call site, not one frame further up)", data.Line, wantLine)
 	}
-	if fn, _ := data["function"].(string); !strings.Contains(fn, "TestFindErrorOrigin_ThroughW") {
-		t.Fatalf(`data["function"] = %v, want it to mention this test function`, data["function"])
+	if !strings.Contains(data.Function, "TestFindErrorOrigin_ThroughW") {
+		t.Fatalf("Function = %q, want it to mention this test function", data.Function)
 	}
 }

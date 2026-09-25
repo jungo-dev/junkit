@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tracer Debug Dashboard</title>
+<style>
+  :root {
+    --bg: #0a0a0b; --card: #16161a; --border: #2a2a2e;
+    --text: #fafafa; --muted: #71717a; --primary: #3b82f6;
+    --success: #22c55e; --warning: #f59e0b; --error: #ef4444;
+    --span: #4ade80; --sql: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.4 Inter, system-ui, -apple-system, sans-serif;
+  }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  h1 { font-size: 16px; margin: 0; }
+  main { padding: 16px; }
+
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+  .card-head {
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    padding: 6px 12px; border-bottom: 1px solid var(--border); background: rgba(255,255,255,0.02); font-size: 12px;
+  }
+  .card-body { padding: 10px 12px; }
+  .card.failed { border-color: var(--error); }
+  .muted { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .badge { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; margin-right: 8px; }
+  .badge-variable { background: rgba(34,197,94,.15); color: #4ade80; }
+  .badge-sql { background: rgba(59,130,246,.15); color: #60a5fa; }
+  .badge-warning { background: rgba(245,158,11,.15); color: #fbbf24; }
+  .badge-error { background: rgba(239,68,68,.15); color: #f87171; }
+
+  .note { margin: 10px 0; padding: 6px 10px; border-left: 3px solid var(--warning); border-radius: 0 6px 6px 0; background: rgba(245,158,11,.05); color: var(--warning); font-style: italic; }
+  .note.span { border-color: var(--span); background: rgba(74,222,128,.05); color: var(--span); font-style: normal; }
+
+  pre {
+    margin: 0; padding: 10px; overflow-x: auto; border: 1px solid var(--border); border-radius: 6px;
+    background: #0d0d0d; color: #e2e8f0; font: 12px/1.5 'JetBrains Mono', monospace;
+  }
+  pre + pre, pre + details { margin-top: 8px; }
+  pre.sql { white-space: pre-wrap; word-break: break-word; color: #93c5fd; }
+  .sql-error { margin: 8px 0 4px; color: var(--error); font-weight: 700; }
+  .sql-origin { margin-bottom: 8px; }
+  .issue-msg { font-weight: 700; margin-bottom: 6px; }
+  .error .issue-msg { color: var(--error); }
+  .warning .issue-msg { color: var(--warning); }
+  summary { cursor: pointer; color: var(--primary); font-size: 12px; margin-bottom: 6px; }
+  .stack { color: #f87171; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 28px; }
+  .stat b { display: block; font-size: 18px; font-variant-numeric: tabular-nums; }
+  .stat.failed b { color: var(--error); }
+  .repeated code { display: block; margin-top: 4px; color: var(--muted); font: 11px 'JetBrains Mono', monospace; word-break: break-word; }
+  .repeated { margin-top: 10px; padding: 8px 10px; border-radius: 6px; background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); color: #fbbf24; font-size: 12px; }
+
+  .wf-row { display: grid; grid-template-columns: minmax(120px, 30%) 1fr 70px; gap: 8px; align-items: center; font-size: 11px; padding: 2px 0; }
+  .wf-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wf-track { position: relative; height: 12px; background: rgba(255,255,255,.03); border-radius: 3px; }
+  .wf-bar { position: absolute; top: 0; bottom: 0; min-width: 2px; border-radius: 3px; }
+  .wf-bar.span { background: var(--span); } .wf-bar.sql { background: var(--sql); }
+  .wf-dur { text-align: right; }
+  footer { text-align: center; padding: 4px 12px 16px; color: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<header><h1>🚀 Tracer Debug Dashboard</h1></header>
+<main>
+  {{with .DB}}{{if .Queries}}
+  <section class="card"><div class="card-body">
+    <div class="stats">
+      <div class="stat"><b>{{.Queries}}</b><span class="muted">QUERIES</span></div>
+      {{if .Failed}}<div class="stat failed"><b>{{.Failed}}</b><span class="muted">FAILED</span></div>{{end}}
+      <div class="stat"><b>{{printf "%.2f" .TotalMS}}ms</b><span class="muted">DB TIME</span></div>
+      <div class="stat"><b>{{printf "%.1f" .Percent}}%</b><span class="muted">OF REQUEST</span></div>
+    </div>
+    {{range .Repeated}}<div class="repeated">⚠️ <strong>{{.Name}}</strong> ran {{.Count}} times ({{printf "%.2f" .TotalMS}}ms total), possible N+1{{with .SQL}}<code>{{.}}</code>{{end}}</div>{{end}}
+  </div></section>
+  {{end}}{{end}}
+
+  {{if .Timeline}}
+  <section class="card">
+    <div class="card-head"><strong>⏱ Timeline</strong><span class="muted">Total: {{printf "%.2f" .TotalMS}}ms</span></div>
+    <div class="card-body">
+      {{range .Timeline}}
+      <div class="wf-row" title="{{.Label}}">
+        <span class="wf-label">{{.Label}}</span>
+        <span class="wf-track"><span class="wf-bar {{.Type}}" style="left:{{printf "%.3f" .LeftPct}}%;width:{{printf "%.3f" .WidthPct}}%"></span></span>
+        <span class="wf-dur muted">{{printf "%.2f" .DurationMS}}ms</span>
+      </div>
+      {{end}}
+    </div>
+  </section>
+  {{end}}
+
+  {{range .Items}}
+  {{if eq .Type "comment"}}
+  <div class="note">💬 {{.Label}}</div>
+  {{else if eq .Type "span"}}
+  <div class="note span">⏱ {{.Label}} <span class="muted">{{printf "%.2f" .DurationMS}}ms</span></div>
+  {{else}}
+  <section class="card {{.Type}}{{if .SQLError}} failed{{end}}">
+    <div class="card-head">
+      <div><span class="badge badge-{{.Type}}">{{.Type}}</span><strong>{{.Label}}</strong></div>
+      <span class="muted">{{if .DurationMS}}{{printf "%.2f" .DurationMS}}ms · {{end}}#{{.Index}}</span>
+    </div>
+    <div class="card-body">
+      {{with .Issue}}
+        <div class="issue-msg">{{.Error}}</div>
+        <div class="muted">📍 {{.Location}}:{{.Line}} · {{.Function}}</div>
+        {{if .Stack}}<details><summary>Stack Trace</summary><pre class="stack">{{.Stack}}</pre></details>{{end}}
+      {{else}}
+        {{if .SQL}}<pre class="sql">{{.SQL}}</pre>{{end}}
+        {{with .SQLError}}
+        <div class="sql-error">✘ {{.Error}}</div>
+        {{if .Location}}<div class="muted sql-origin">📍 {{.Location}} · {{.Function}}</div>{{end}}
+        {{end}}
+        {{if .Body}}<pre>{{.Body}}</pre>{{end}}
+      {{end}}
+    </div>
+  </section>
+  {{end}}
+  {{end}}
+</main>
+<footer>junkit/tracer</footer>
+</body>
+</html>

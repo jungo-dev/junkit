@@ -79,30 +79,13 @@ func TestSplitHostPort(t *testing.T) {
 func TestHTTPInfo(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 
-	t.Run("disabled debugger records nothing", func(t *testing.T) {
-		d := tracer.New()
-		ctx := tracer.WithContext(r.Context(), d)
+	tracer.HTTPInfo(r.Context(), r) // no Debugger: must not panic
 
-		tracer.HTTPInfo(ctx, r)
+	d := tracer.New()
+	tracer.HTTPInfo(tracer.WithContext(r.Context(), d), r)
 
-		if logs := d.GetLogs(); logs != nil {
-			t.Fatalf("GetLogs() = %v, want nil when the debugger is disabled", logs)
-		}
-	})
-
-	t.Run("enabled debugger records a REQUEST & SERVER INFO entry", func(t *testing.T) {
-		d := tracer.New()
-		d.Enable()
-		ctx := tracer.WithContext(r.Context(), d)
-
-		tracer.HTTPInfo(ctx, r)
-
-		logs := d.GetLogs()
-		if len(logs) != 1 {
-			t.Fatalf("got %d log entries, want 1", len(logs))
-		}
-		if logs[0].Type != "variable" || logs[0].Label != "REQUEST & SERVER INFO" {
-			t.Fatalf("log entry = %+v, want Type=variable Label=%q", logs[0], "REQUEST & SERVER INFO")
-		}
-	})
+	logs := d.Logs()
+	if len(logs) != 1 || logs[0].Type != tracer.TypeVariable || logs[0].Label != "REQUEST & SERVER INFO" {
+		t.Fatalf("Logs() = %+v, want one REQUEST & SERVER INFO variable entry", logs)
+	}
 }

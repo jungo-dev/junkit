@@ -34,10 +34,7 @@ func TracerDebug(key, value string) gin.HandlerFunc {
 		}
 
 		start := time.Now()
-		debugger := tracer.New()
-		debugger.Enable()
-
-		ctx := tracer.WithContext(c.Request.Context(), debugger)
+		ctx := tracer.WithContext(c.Request.Context(), tracer.New())
 		c.Request = c.Request.WithContext(ctx)
 
 		bw := &bodyWriter{ResponseWriter: c.Writer}
@@ -49,7 +46,7 @@ func TracerDebug(key, value string) gin.HandlerFunc {
 	}
 }
 
-// renderTracerDashboard renders HTML or ANSI text debug dashboard for the request.
+// renderTracerDashboard renders the debug dashboard as HTML, or as JSON for CLI clients.
 func renderTracerDashboard(c *gin.Context, bw *bodyWriter, start time.Time) {
 	if r := recover(); r != nil {
 		if _, ok := r.(tracer.BreakpointSignal); !ok {
@@ -62,15 +59,17 @@ func renderTracerDashboard(c *gin.Context, bw *bodyWriter, start time.Time) {
 	}
 
 	c.Writer = bw.ResponseWriter
-	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 	c.Header("Pragma", "no-cache")
 	c.Header("Expires", "0")
 
+	// Set Content-Type explicitly: c.Data won't replace one the handler already set.
 	if isTerminalClient(c) {
-		c.String(http.StatusOK, tracer.RenderText(c.Request.Context()))
+		c.Header("Content-Type", "application/json; charset=utf-8")
+		c.Data(http.StatusOK, "application/json; charset=utf-8", tracer.RenderJSON(c.Request.Context()))
 	} else {
-		c.String(http.StatusOK, tracer.RenderHTML(c.Request.Context()))
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.Data(http.StatusOK, "text/html; charset=utf-8", []byte(tracer.RenderHTML(c.Request.Context())))
 	}
 }
 

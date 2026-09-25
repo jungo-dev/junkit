@@ -1,6 +1,7 @@
 package middleware_test
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -70,7 +71,7 @@ func TestTracerDebug_RendersDashboardWhenActivated(t *testing.T) {
 	}
 }
 
-func TestTracerDebug_RendersPlainTextForCLIClients(t *testing.T) {
+func TestTracerDebug_RendersJSONForCLIClients(t *testing.T) {
 	router := newTracerDebugRouter("t_debug", "1234", func(c *gin.Context) {
 		c.String(http.StatusOK, "normal response")
 	})
@@ -84,10 +85,12 @@ func TestTracerDebug_RendersPlainTextForCLIClients(t *testing.T) {
 	if w.Body.Len() == 0 {
 		t.Fatal("expected a non-empty rendered body for a curl client")
 	}
-	// The dashboard content differs by renderer, but the important
-	// contract is that curl gets the text renderer, not raw HTML tags.
-	if strings.Contains(w.Body.String(), "<html") || strings.Contains(w.Body.String(), "<!DOCTYPE") {
-		t.Error("a curl User-Agent should get the plain-text renderer, not HTML markup")
+	// A curl client gets the JSON report (pipeable into jq), not HTML markup.
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json for a CLI client", ct)
+	}
+	if !json.Valid(w.Body.Bytes()) {
+		t.Errorf("body is not valid JSON: %s", w.Body.String())
 	}
 }
 

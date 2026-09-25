@@ -1,13 +1,27 @@
-// Package tracer provides request-scoped debug logging and fallback Zap logger integration.
+// Package tracer records request-scoped debug information (notes, values,
+// errors, spans and SQL queries) and renders it as a debug dashboard.
+//
+// Recording only happens when a Debugger is attached to the context, which
+// middleware.TracerDebug does for requests carrying the debug query key.
+// Without one, every function in this package is a cheap no-op.
 package tracer
 
 import (
 	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+)
+
+// Entry types recorded by this package.
+const (
+	TypeComment  = "comment"
+	TypeVariable = "variable"
+	TypeWarning  = "warning"
+	TypeError    = "error"
+	TypeSpan     = "span"
+	TypeSQL      = "sql"
 )
 
 // debuggerContextKey is the context key under which a *Debugger is stored.
@@ -16,111 +30,63 @@ type debuggerContextKey struct{}
 // BreakpointSignal is panicked by Stop to halt request processing for debugging.
 type BreakpointSignal struct{}
 
-// LastQueryInfo captures metadata for the most recently executed SQL query.
-type LastQueryInfo struct {
-	QueryName  string
-	Operation  string
-	FinalSQL   string
-	DurationMS float64
-}
-
 // LogEntry is one recorded unit of debug information.
 type LogEntry struct {
-	Type  string `json:"type"` // "comment", "variable", "warning", "error", "sql_result", "span"
-	Label string `json:"label"`
-	Data  any    `json:"data,omitempty"`
+	Type       string  `json:"type"`
+	Label      string  `json:"label"`
+	AtMS       float64 `json:"at_ms"`                 // offset from request start at which the entry began
+	DurationMS float64 `json:"duration_ms,omitempty"` // set for spans and SQL queries
+	Data       any     `json:"data,omitempty"`
 }
 
-// Debugger accumulates LogEntry values for a single request in a thread-safe manner.
+// Debugger accumulates LogEntry values for a single request.
+// All methods are safe for concurrent use and on a nil receiver.
 type Debugger struct {
-	mu            sync.RWMutex
-	enabled       bool
-	logs          []LogEntry
-	lastQueryMu   sync.RWMutex
-	lastQueryInfo LastQueryInfo
-	startedAt     time.Time
-	activeSpans   atomic.Int32
+	mu        sync.Mutex
+	startedAt time.Time
+	logs      []LogEntry
 }
 
-// New creates an empty, disabled Debugger instance.
+// New creates an empty Debugger whose timeline starts now.
 func New() *Debugger {
-	return &Debugger{logs: make([]LogEntry, 0, 32), startedAt: time.Now()}
+	return &Debugger{startedAt: time.Now(), logs: make([]LogEntry, 0, 32)}
 }
 
-// elapsedMS returns the milliseconds elapsed since d was created, used to
-// place spans and traced queries on the dashboard timeline.
-func (d *Debugger) elapsedMS() float64 {
-	return float64(time.Since(d.startedAt).Microseconds()) / 1000.0
+// sinceStartMS returns the milliseconds elapsed since d was created.
+func (d *Debugger) sinceStartMS() float64 {
+	return msSince(d.startedAt)
 }
 
-// pushSpanDepth marks a span or query as active and returns its nesting depth (0 for outermost).
-func (d *Debugger) pushSpanDepth() int {
-	return int(d.activeSpans.Add(1)) - 1
+// msSince returns the milliseconds elapsed since t, at microsecond precision.
+func msSince(t time.Time) float64 {
+	return float64(time.Since(t).Microseconds()) / 1000.0
 }
 
-// popSpanDepth marks one active span/query as finished.
-func (d *Debugger) popSpanDepth() {
-	d.activeSpans.Add(-1)
-}
-
-// WithContext returns a copy of ctx carrying d, retrievable via FromContext.
-func WithContext(ctx context.Context, d *Debugger) context.Context {
-	return context.WithValue(ctx, debuggerContextKey{}, d)
-}
-
-// FromContext retrieves the Debugger attached to ctx by WithContext, or nil if none is attached.
-func FromContext(ctx context.Context) *Debugger {
-	d, _ := ctx.Value(debuggerContextKey{}).(*Debugger)
-	return d
-}
-
-// Enable activates log collection for the Debugger.
-func (d *Debugger) Enable() {
-	if d == nil {
-		return
-	}
-	d.mu.Lock()
-	d.enabled = true
-	d.mu.Unlock()
-}
-
-// IsEnabled reports whether log collection is active.
-func (d *Debugger) IsEnabled() bool {
-	if d == nil {
-		return false
-	}
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.enabled
-}
-
-// Reset clears recorded logs and disables log collection.
-func (d *Debugger) Reset() {
-	if d == nil {
-		return
-	}
-	d.mu.Lock()
-	d.logs = d.logs[:0]
-	d.enabled = false
-	d.mu.Unlock()
-	d.ClearLastQueryInfo()
-}
-
-// Append records a log entry if the Debugger is enabled.
+// Append records a log entry.
 func (d *Debugger) Append(entry LogEntry) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.logs = append(d.logs, entry)
+	d.mu.Unlock()
+}
+
+// record appends an entry of the given type, stamped with the current offset.
+func (d *Debugger) record(typ, label string, data any) {
+	if d == nil {
+		return
+	}
+	d.Append(LogEntry{Type: typ, Label: label, AtMS: d.sinceStartMS(), Data: data})
+}
+
+// Logs returns a snapshot copy of every entry recorded so far.
+func (d *Debugger) Logs() []LogEntry {
+	if d == nil {
+		return nil
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-
-	if !d.enabled {
-		return
-	}
-	d.logs = append(d.logs, entry)
-}
-
-// GetLogs returns a snapshot copy of every entry recorded so far.
-func (d *Debugger) GetLogs() []LogEntry {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
 
 	if len(d.logs) == 0 {
 		return nil
@@ -130,50 +96,30 @@ func (d *Debugger) GetLogs() []LogEntry {
 	return cp
 }
 
-// SetLastQueryInfo records metadata for the most recently executed query.
-func (d *Debugger) SetLastQueryInfo(name, operation, finalSQL string, durationMS float64) {
-	d.lastQueryMu.Lock()
-	d.lastQueryInfo = LastQueryInfo{QueryName: name, Operation: operation, FinalSQL: finalSQL, DurationMS: durationMS}
-	d.lastQueryMu.Unlock()
+// WithContext returns a copy of ctx carrying d, retrievable via FromContext.
+func WithContext(ctx context.Context, d *Debugger) context.Context {
+	return context.WithValue(ctx, debuggerContextKey{}, d)
 }
 
-// GetLastQueryInfo returns the most recently recorded query metadata.
-func (d *Debugger) GetLastQueryInfo() LastQueryInfo {
-	d.lastQueryMu.RLock()
-	defer d.lastQueryMu.RUnlock()
-	return d.lastQueryInfo
-}
-
-// ClearLastQueryInfo resets the last-query metadata to its zero value.
-func (d *Debugger) ClearLastQueryInfo() {
-	d.lastQueryMu.Lock()
-	d.lastQueryInfo = LastQueryInfo{}
-	d.lastQueryMu.Unlock()
-}
-
-// GetLastQueryInfoCtx returns the last query metadata recorded on ctx's Debugger.
-func GetLastQueryInfoCtx(ctx context.Context) LastQueryInfo {
-	d := FromContext(ctx)
-	if d == nil {
-		return LastQueryInfo{}
+// FromContext retrieves the Debugger attached to ctx, or nil if none is attached.
+// A *gin.Context is resolved through its request context, since gin only
+// falls back to it when the engine enables ContextWithFallback.
+func FromContext(ctx context.Context) *Debugger {
+	if gc, ok := ctx.(*gin.Context); ok {
+		if gc == nil || gc.Request == nil {
+			return nil
+		}
+		ctx = gc.Request.Context()
 	}
-	return d.GetLastQueryInfo()
-}
-
-// ToContext extracts context.Context from either a *gin.Context or a context.Context.
-func ToContext(c any) context.Context {
-	switch v := c.(type) {
-	case *gin.Context:
-		return v.Request.Context()
-	case context.Context:
-		return v
-	default:
+	if ctx == nil {
 		return nil
 	}
+	d, _ := ctx.Value(debuggerContextKey{}).(*Debugger)
+	return d
 }
 
-// IsEnabledCtx reports whether ctx carries an enabled Debugger.
-func IsEnabledCtx(ctx context.Context) bool {
-	d := FromContext(ctx)
-	return d != nil && d.IsEnabled()
+// Enabled reports whether ctx carries a Debugger, i.e. whether tracer calls
+// on ctx record anything. Use it to skip expensive debug-only work.
+func Enabled(ctx context.Context) bool {
+	return FromContext(ctx) != nil
 }

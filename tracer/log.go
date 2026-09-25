@@ -5,21 +5,16 @@ import (
 	"fmt"
 	"runtime/debug"
 	"time"
-
-	"go.uber.org/zap"
 )
 
-// globalZap is the fallback logger C/V/W/E use when no enabled Debugger is
-// attached to the given context, set once via BindLogger at startup.
-var globalZap *zap.Logger
-
-// BindLogger sets the fallback *zap.Logger for tracer logging when no Debugger is enabled.
-//
-// Usage:
-//
-//	tracer.BindLogger(zapLogger)
-func BindLogger(l *zap.Logger) {
-	globalZap = l
+// IssueData is the payload of a warning or error entry.
+type IssueData struct {
+	Error     string `json:"error"`
+	Location  string `json:"location"`
+	Line      int    `json:"line"`
+	Function  string `json:"function"`
+	Stack     string `json:"stack,omitempty"`
+	Timestamp string `json:"timestamp"`
 }
 
 // C (Comment) records a plain text note.
@@ -27,19 +22,8 @@ func BindLogger(l *zap.Logger) {
 // Usage:
 //
 //	tracer.C(ctx, "starting user synchronization")
-func C(c any, message string) {
-	ctx := ToContext(c)
-	if ctx == nil {
-		return
-	}
-
-	if d := FromContext(ctx); d.IsEnabled() {
-		d.Append(LogEntry{Type: "comment", Label: message})
-		return
-	}
-	if globalZap != nil {
-		globalZap.Info("🐞 [TRACE] " + message)
-	}
+func C(ctx context.Context, message string) {
+	FromContext(ctx).record(TypeComment, message, nil)
 }
 
 // V (Variable) records one or more values under a shared label.
@@ -47,152 +31,80 @@ func C(c any, message string) {
 // Usage:
 //
 //	tracer.V(ctx, "user profile", user)
-func V(c any, label string, values ...any) {
-	ctx := ToContext(c)
-	if ctx == nil {
+func V(ctx context.Context, label string, values ...any) {
+	d := FromContext(ctx)
+	if d == nil {
 		return
 	}
-
-	d := FromContext(ctx)
-	enabled := d.IsEnabled()
-
-	for _, val := range values {
-		if enabled {
-			d.Append(LogEntry{Type: "variable", Label: label, Data: val})
-		} else if globalZap != nil {
-			globalZap.Info("🐞 [TRACE] "+label, zap.Any("value", val))
+	for _, v := range values {
+		if err, ok := v.(error); ok {
+			v = err.Error() // error values usually marshal to an empty JSON object
 		}
+		d.record(TypeVariable, label, v)
 	}
 }
 
-// W (Warning) records a non-fatal warning message without a stack trace.
+// W (Warning) records a non-fatal problem with its source location.
 //
 // Usage:
 //
 //	tracer.W(ctx, "user not found", err)
-func W(c any, label string, err any) {
-	ctx := ToContext(c)
-	if ctx == nil {
-		return
-	}
-
-	labelStr := label
-	if labelStr == "" {
-		labelStr = "WARNING"
-	}
-
-	msg := fmt.Sprintf("%v", err)
-	file, line, fn := FindErrorOrigin()
-
-	data := map[string]any{
-		"error":     msg,
-		"label":     labelStr,
-		"location":  file,
-		"line":      line,
-		"function":  fn,
-		"timestamp": time.Now().Format("2006-01-02 15:04:05.000 -0700"),
-	}
-	if info := GetLastQueryInfoCtx(ctx); info.FinalSQL != "" {
-		data["sql"] = info.FinalSQL
-		data["query_name"] = info.QueryName
-		data["duration_ms"] = info.DurationMS
-	}
-
-	if d := FromContext(ctx); d.IsEnabled() {
-		d.Append(LogEntry{Type: "warning", Label: labelStr, Data: data})
-	}
-
-	if globalZap != nil {
-		globalZap.Warn(labelStr,
-			zap.String("error", msg),
-			zap.String("file", file),
-			zap.Int("line", line),
-			zap.String("function", fn),
-		)
+func W(ctx context.Context, label string, err any) {
+	if d := FromContext(ctx); d != nil {
+		d.record(TypeWarning, labelOr(label, "WARNING"), newIssue(err, false))
 	}
 }
 
-// E (Error) records an error with source location and full stack trace.
+// E (Error) records an error with its source location and full stack trace.
 //
 // Usage:
 //
 //	if err != nil {
 //	    tracer.E(ctx, "database query failed", err)
 //	}
-func E(c any, label string, err any) {
-	ctx := ToContext(c)
-	if ctx == nil {
-		return
-	}
-
-	labelStr := label
-	if labelStr == "" {
-		labelStr = "ERROR"
-	}
-
-	msg := fmt.Sprintf("%v", err)
-	file, line, fn := FindErrorOrigin()
-	stack := debug.Stack()
-
-	data := map[string]any{
-		"error":     msg,
-		"label":     labelStr,
-		"location":  file,
-		"line":      line,
-		"function":  fn,
-		"stack":     string(stack),
-		"timestamp": time.Now().Format("2006-01-02 15:04:05.000 -0700"),
-	}
-	if info := GetLastQueryInfoCtx(ctx); info.FinalSQL != "" {
-		data["sql"] = info.FinalSQL
-		data["query_name"] = info.QueryName
-		data["duration_ms"] = info.DurationMS
-	}
-
-	if d := FromContext(ctx); d.IsEnabled() {
-		d.Append(LogEntry{Type: "error", Label: labelStr, Data: data})
-	}
-
-	if globalZap != nil {
-		globalZap.Error(labelStr,
-			zap.String("error", msg),
-			zap.String("file", file),
-			zap.Int("line", line),
-			zap.String("function", fn),
-			zap.ByteString("stack", stack),
-		)
+func E(ctx context.Context, label string, err any) {
+	if d := FromContext(ctx); d != nil {
+		d.record(TypeError, labelOr(label, "ERROR"), newIssue(err, true))
 	}
 }
 
-// Stop records values and panics with BreakpointSignal when the Debugger is enabled.
+// Stop records values, then halts the request so the dashboard shows the state at this point.
+//
+// It panics with BreakpointSignal, which middleware.TracerDebug recovers. Only
+// call it from the request's own goroutine: a panic in any other goroutine
+// is not recovered and crashes the process.
 //
 // Usage:
 //
 //	tracer.Stop(ctx, "user before save", user)
-func Stop(c any, label string, values ...any) {
-	V(c, label, values...)
-
-	ctx := ToContext(c)
-	if ctx != nil && IsEnabledCtx(ctx) {
-		panic(BreakpointSignal{})
+func Stop(ctx context.Context, label string, values ...any) {
+	if !Enabled(ctx) {
+		return
 	}
+	V(ctx, label, values...)
+	panic(BreakpointSignal{})
 }
 
-// SQL records the most recently executed query metadata and optional result.
-func SQL(ctx context.Context, result any) {
-	d := FromContext(ctx)
-	if !d.IsEnabled() {
-		return
+// labelOr returns label, or fallback when label is empty.
+func labelOr(label, fallback string) string {
+	if label == "" {
+		return fallback
 	}
+	return label
+}
 
-	info := d.GetLastQueryInfo()
-	if info.QueryName == "" {
-		return
+// newIssue builds the W/E payload, locating the first caller outside this package.
+func newIssue(err any, withStack bool) IssueData {
+	file, line, fn := FindErrorOrigin()
+	issue := IssueData{
+		Error:     fmt.Sprintf("%v", err),
+		Location:  file,
+		Line:      line,
+		Function:  fn,
+		Timestamp: time.Now().Format("2006-01-02 15:04:05.000 -0700"),
 	}
-
-	label := fmt.Sprintf("%s | %.2fms", info.QueryName, info.DurationMS)
-	if info.FinalSQL != "" {
-		label += " | " + info.FinalSQL
+	if withStack {
+		issue.Stack = string(debug.Stack())
 	}
-	d.Append(LogEntry{Type: "sql_result", Label: label, Data: result})
+	return issue
 }
