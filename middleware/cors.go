@@ -1,3 +1,4 @@
+// Package middleware provides Gin HTTP middleware: CORS, rate limiting, panic recovery, security headers, tracing, payload logging and authentication.
 package middleware
 
 import (

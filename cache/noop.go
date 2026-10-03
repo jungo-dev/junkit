@@ -24,6 +24,11 @@ func (c *NoopCache[T]) Set(context.Context, string, T, time.Duration) error {
 	return nil
 }
 
+// Incr always returns 0.
+func (c *NoopCache[T]) Incr(context.Context, string, time.Duration) (int64, error) {
+	return 0, nil
+}
+
 // Delete is a no-op that always succeeds.
 func (c *NoopCache[T]) Delete(context.Context, string) error {
 	return nil

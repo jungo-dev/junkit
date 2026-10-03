@@ -34,6 +34,15 @@ type RedisOptions struct {
 	Logger Logger
 }
 
+// incrScript increments KEYS[1] and sets its expiry (ARGV[1] ms) if it has none, atomically.
+var incrScript = redis.NewScript(`
+local n = redis.call('INCR', KEYS[1])
+if tonumber(ARGV[1]) > 0 and redis.call('PTTL', KEYS[1]) < 0 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return n
+`)
+
 // RedisCache is a generic Cache backed by Redis; values are JSON-encoded.
 type RedisCache[T any] struct {
 	client *redis.Client
@@ -126,6 +135,11 @@ func (c *RedisCache[T]) Set(ctx context.Context, key string, value T, ttl time.D
 		return err
 	}
 	return nil
+}
+
+// Incr implements Cache.
+func (c *RedisCache[T]) Incr(ctx context.Context, key string, ttl time.Duration) (int64, error) {
+	return incrScript.Run(ctx, c.client, []string{key}, ttl.Milliseconds()).Int64()
 }
 
 // Delete implements Cache.
